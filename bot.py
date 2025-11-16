@@ -1,10 +1,12 @@
 import logging
 import os
-from datetime import time
+import sys
+from datetime import time, datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 import pytz
 from dotenv import load_dotenv
 
@@ -80,6 +82,63 @@ class SpanishVerbBot:
             await update.message.reply_text(
                 "Глагол дня ещё не выбран. Жди утреннего сообщения в 09:00!"
             )
+
+    async def test_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Тестовая команда для прохождения дневного флоу с интервалом 1 минута"""
+        user_id = update.effective_user.id
+
+        if not self.state_manager.user_exists(user_id):
+            self.state_manager.create_user(user_id)
+
+        await update.message.reply_text(
+            "🧪 Запускаю тестовый дневной флоу!\n\n"
+            "Ты получишь:\n"
+            "- Глагол дня (сейчас)\n"
+            "- Квиз №1 (через 1 минуту)\n"
+            "- Квиз №2 (через 2 минуты)\n"
+            "- Времена глаголов (с 3-й минуты, каждую минуту)"
+        )
+
+        # Сбрасываем состояние времен для пользователя
+        self.state_manager.reset_sent_tenses(user_id)
+
+        # Отправляем глагол дня немедленно
+        await self.send_verb_of_the_day(user_id)
+
+        # Планируем задачи с интервалом 1 минута
+        now = datetime.now(TIMEZONE)
+
+        # Квиз №1 через 1 минуту
+        self.scheduler.add_job(
+            self.send_quiz_1,
+            DateTrigger(run_date=now + timedelta(minutes=1), timezone=TIMEZONE),
+            args=[user_id],
+            id=f"test_quiz1_{user_id}",
+            replace_existing=True
+        )
+
+        # Квиз №2 через 2 минуты
+        self.scheduler.add_job(
+            self.send_quiz_2,
+            DateTrigger(run_date=now + timedelta(minutes=2), timezone=TIMEZONE),
+            args=[user_id],
+            id=f"test_quiz2_{user_id}",
+            replace_existing=True
+        )
+
+        # Времена глаголов - начиная с 3-й минуты, каждую минуту
+        # Получаем количество доступных времен
+        all_tenses = self.data_loader.get_tenses()
+        for i, _ in enumerate(all_tenses):
+            self.scheduler.add_job(
+                self.send_next_tense,
+                DateTrigger(run_date=now + timedelta(minutes=3 + i), timezone=TIMEZONE),
+                args=[user_id],
+                id=f"test_tense_{user_id}_{i}",
+                replace_existing=True
+            )
+
+        logger.info(f"Test flow scheduled for user {user_id}")
 
     async def send_verb_of_the_day(self, user_id: int):
         """Отправка глагола дня (09:00)"""
@@ -220,25 +279,64 @@ class SpanishVerbBot:
         query = update.callback_query
         await query.answer()
 
-        data = query.data.split('_')
-        quiz_type = data[0]
-        target_user_id = int(data[1])
-        is_correct = data[2] == 'True'
-        correct_answer = '_'.join(data[3:])
+        try:
+            # Валидация callback data
+            data = query.data.split('_')
 
-        # Проверяем, что пользователь отвечает на свой квиз
-        if query.from_user.id != target_user_id:
-            await query.answer("Это не твой квиз!", show_alert=True)
-            return
+            # Проверяем минимальную длину (quiz_type, user_id, is_correct, correct_answer)
+            if len(data) < 4:
+                logger.warning(f"Invalid callback data format: {query.data}")
+                await query.answer("Неверный формат данных", show_alert=True)
+                return
 
-        if is_correct:
-            await query.edit_message_text(
-                text=query.message.text + f"\n\n✅ Верно!"
-            )
-        else:
-            await query.edit_message_text(
-                text=query.message.text + f"\n\n❌ Неверно. Правильный ответ: {correct_answer}"
-            )
+            # Извлекаем и валидируем компоненты
+            quiz_type = data[0]
+
+            # Валидация типа квиза
+            if quiz_type not in ['q1', 'q2']:
+                logger.warning(f"Invalid quiz type: {quiz_type}")
+                await query.answer("Неверный тип квиза", show_alert=True)
+                return
+
+            # Валидация user_id
+            try:
+                target_user_id = int(data[1])
+            except ValueError:
+                logger.warning(f"Invalid user_id in callback data: {data[1]}")
+                await query.answer("Неверный формат данных", show_alert=True)
+                return
+
+            # Валидация is_correct
+            if data[2] not in ['True', 'False']:
+                logger.warning(f"Invalid is_correct value: {data[2]}")
+                await query.answer("Неверный формат данных", show_alert=True)
+                return
+
+            is_correct = data[2] == 'True'
+            correct_answer = '_'.join(data[3:])
+
+            # Валидация correct_answer
+            if not correct_answer or len(correct_answer) > 200:
+                logger.warning(f"Invalid correct_answer: {correct_answer}")
+                await query.answer("Неверный формат данных", show_alert=True)
+                return
+
+            # Проверяем, что пользователь отвечает на свой квиз
+            if query.from_user.id != target_user_id:
+                await query.answer("Это не твой квиз!", show_alert=True)
+                return
+
+            if is_correct:
+                await query.edit_message_text(
+                    text=query.message.text + f"\n\n✅ Верно!"
+                )
+            else:
+                await query.edit_message_text(
+                    text=query.message.text + f"\n\n❌ Неверно. Правильный ответ: {correct_answer}"
+                )
+        except Exception as e:
+            logger.error(f"Error handling quiz callback: {e}")
+            await query.answer("Произошла ошибка при обработке ответа", show_alert=True)
 
     def schedule_jobs(self):
         """Настройка расписания задач"""
@@ -332,19 +430,26 @@ class SpanishVerbBot:
     def run(self):
         """Запуск бота"""
         if not TELEGRAM_TOKEN:
-            raise ValueError("TELEGRAM_BOT_TOKEN not set in environment variables")
+            logger.error("TELEGRAM_BOT_TOKEN not set in environment variables")
+            logger.error("Please set TELEGRAM_BOT_TOKEN in your .env file or environment")
+            sys.exit(1)
 
-        # Создаём приложение
-        application = Application.builder().token(TELEGRAM_TOKEN).post_init(self.post_init).build()
+        try:
+            # Создаём приложение
+            application = Application.builder().token(TELEGRAM_TOKEN).post_init(self.post_init).build()
 
-        # Добавляем обработчики
-        application.add_handler(CommandHandler("start", self.start_command))
-        application.add_handler(CommandHandler("status", self.status_command))
-        application.add_handler(CallbackQueryHandler(self.handle_quiz_callback))
+            # Добавляем обработчики
+            application.add_handler(CommandHandler("start", self.start_command))
+            application.add_handler(CommandHandler("status", self.status_command))
+            application.add_handler(CommandHandler("test", self.test_command))
+            application.add_handler(CallbackQueryHandler(self.handle_quiz_callback))
 
-        # Запускаем бота
-        logger.info("Starting bot...")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+            # Запускаем бота
+            logger.info("Starting bot...")
+            application.run_polling(allowed_updates=Update.ALL_TYPES)
+        except Exception as e:
+            logger.error(f"Failed to start bot: {e}")
+            sys.exit(1)
 
 
 if __name__ == '__main__':
